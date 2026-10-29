@@ -1,31 +1,20 @@
 import { extension_settings, getContext } from '../../../extensions.js';
-import { saveSettingsDebounced, eventSource, event_types } from '../../../../script.js';
+import { saveSettingsDebounced, eventSource, event_types, updateMessageBlock, saveChatConditional } from '../../../../script.js';
 
 const MODULE = 'roleplay_leash';
-const KEY_MAIN = 'roleplay_leash_main';
-const KEY_SHORT = 'roleplay_leash_short';
-
-const DEFAULT_MAIN = [
-    '[MANDATORY FORMATTING RULES - THESE OVERRIDE ANY OTHER STYLE HABIT AND MUST BE FOLLOWED IN EVERY SINGLE REPLY, FROM FIRST TO LAST LINE:',
-    '1. Every spoken line of dialogue goes inside double quotes: "like this".',
-    '2. Every action, movement, gesture, thought, description and narration goes inside single asterisks: *like this*.',
-    '3. Never write plain unformatted text. Every piece of text must be either inside "quotes" or inside *asterisks*.',
-    '4. Never put dialogue inside asterisks and never put actions inside quotes. Close the asterisks before opening the quotes.',
-    '5. Keep this formatting consistent for the entire roleplay, no matter how long it gets. Never drop it, even if previous messages did not follow it.',
-    'Example: *She turns around and smiles.* "I was waiting for you." *She steps closer, lowering her voice.* "Did you bring it?"',
-    'Write in the same language as the conversation.]'
-].join('\n');
-
-const DEFAULT_SHORT = '[Reminder: dialogue ALWAYS in "quotes", actions/narration/thoughts ALWAYS in *asterisks*. No plain text. Keep this format in this reply.]';
 
 const defaults = {
     enabled: true,
-    autofix: true,
-    reminder: true,
-    mainPrompt: DEFAULT_MAIN,
-    shortPrompt: DEFAULT_SHORT,
-    depth: 4
+    fixChar: true,
+    fixUser: true,
+    dashToQuotes: true,
+    fixOnEdit: true,
+    customColors: false,
+    dialogueColor: '#ffd37a',
+    actionColor: '#a8b8d8'
 };
+
+let busy = false;
 
 function getSettings() {
     if (!extension_settings[MODULE]) {
@@ -39,58 +28,130 @@ function getSettings() {
     return extension_settings[MODULE];
 }
 
-function applyPrompts() {
-    const s = getSettings();
-    const ctx = getContext();
-    const IN_CHAT = 1;
-    const ROLE_SYSTEM = 0;
-    if (s.enabled) {
-        ctx.setExtensionPrompt(KEY_MAIN, s.mainPrompt, IN_CHAT, Number(s.depth) || 4, false, ROLE_SYSTEM);
-        ctx.setExtensionPrompt(KEY_SHORT, s.reminder ? s.shortPrompt : '', IN_CHAT, 0, false, ROLE_SYSTEM);
-    } else {
-        ctx.setExtensionPrompt(KEY_MAIN, '', IN_CHAT, 4, false, ROLE_SYSTEM);
-        ctx.setExtensionPrompt(KEY_SHORT, '', IN_CHAT, 0, false, ROLE_SYSTEM);
-    }
+function wrapDialogue(text) {
+    const core = text.trim();
+    const trail = text.match(/\s*$/)[0];
+    return '"' + core + '"' + trail;
 }
 
-function fixLine(line) {
+function fixLine(line, s) {
     const trimmed = line.trim();
     if (!trimmed) return line;
-    if (/^(```|<|#|---|___|\|)/.test(trimmed)) return line;
+    if (/^(<|#|>|\||---|___|\[|\(\(|\/|\{\{)/.test(trimmed)) return line;
+    if (/^[*_\-=~\s]+$/.test(trimmed)) return line;
 
-    let clean = line.replace(/[“”„«»]/g, '"').replace(/\*+/g, '');
-    const quotes = (clean.match(/"/g) || []).length;
-    if (quotes % 2 !== 0) return line;
+    let work = line.replace(/[“”„«»]/g, '"');
 
-    const parts = clean.split(/("[^"]*")/);
-    return parts.map(part => {
-        if (part.startsWith('"') && part.endsWith('"') && part.length >= 2) return part;
-        if (!/[\p{L}\p{N}]/u.test(part)) return part;
-        const lead = part.match(/^\s*/)[0];
-        const trail = part.match(/\s*$/)[0];
-        const core = part.trim();
-        return `${lead}*${core}*${trail}`;
+    if (s.dashToQuotes) {
+        work = work.replace(/^(\s*)[-–—]\s*([^*"\n]+)/, (m, a, b) => a + wrapDialogue(b));
+        work = work.replace(/([*.!?…])(\s*)[-–—]\s+([^*"\n]+)/g, (m, a, sp, b) => a + sp + wrapDialogue(b));
+    }
+
+    const quoteCount = (work.match(/"/g) || []).length;
+    if (quoteCount % 2 !== 0) return line;
+
+    return work.split(/("[^"]*")/).map(part => {
+        if (part.length >= 2 && part.startsWith('"') && part.endsWith('"')) {
+            return '"' + part.slice(1, -1).replace(/\*+/g, '') + '"';
+        }
+        const clean = part.replace(/\*+/g, '');
+        if (!/[\p{L}\p{N}]/u.test(clean)) return clean;
+        const lead = clean.match(/^\s*/)[0];
+        const trail = clean.match(/\s*$/)[0];
+        return lead + '*' + clean.trim() + '*' + trail;
     }).join('');
 }
 
-function fixText(text) {
-    if (!text || text.includes('```')) return text;
-    return text.split('\n').map(fixLine).join('\n');
+function fixText(text, s) {
+    if (!text || typeof text !== 'string') return text;
+    if (/^\s*\//.test(text)) return text;
+    let inFence = false;
+    return text.split('\n').map(line => {
+        if (/^\s*```/.test(line)) {
+            inFence = !inFence;
+            return line;
+        }
+        if (inFence) return line;
+        return fixLine(line, s);
+    }).join('\n');
 }
 
-function onMessageReceived(id) {
+function applyFixToMessage(msg, s) {
+    if (!msg || msg.is_system) return false;
+    if (msg.is_user && !s.fixUser) return false;
+    if (!msg.is_user && !s.fixChar) return false;
+    const fixed = fixText(msg.mes, s);
+    if (fixed === msg.mes) return false;
+    msg.mes = fixed;
+    if (Array.isArray(msg.swipes) && msg.swipe_id !== undefined && msg.swipes[msg.swipe_id] !== undefined) {
+        msg.swipes[msg.swipe_id] = fixed;
+    }
+    return true;
+}
+
+function onMessageSent(id) {
     const s = getSettings();
-    if (!s.enabled || !s.autofix) return;
-    const ctx = getContext();
-    const msg = ctx.chat[id];
-    if (!msg || msg.is_user || msg.is_system) return;
-    const fixed = fixText(msg.mes);
-    if (fixed !== msg.mes) {
-        msg.mes = fixed;
-        if (Array.isArray(msg.swipes) && msg.swipe_id !== undefined) {
-            msg.swipes[msg.swipe_id] = fixed;
+    if (!s.enabled) return;
+    const msg = getContext().chat[id];
+    applyFixToMessage(msg, s);
+}
+
+function onMessageRendered(id) {
+    const s = getSettings();
+    if (!s.enabled || busy) return;
+    const msg = getContext().chat[id];
+    if (!msg || msg.is_user) return;
+    if (applyFixToMessage(msg, s)) {
+        busy = true;
+        try {
+            updateMessageBlock(Number(id), msg);
+            saveChatConditional();
+        } finally {
+            busy = false;
         }
     }
+}
+
+function onMessageEdited(id) {
+    const s = getSettings();
+    if (!s.enabled || !s.fixOnEdit || busy) return;
+    const msg = getContext().chat[id];
+    if (applyFixToMessage(msg, s)) {
+        busy = true;
+        try {
+            updateMessageBlock(Number(id), msg);
+            saveChatConditional();
+        } finally {
+            busy = false;
+        }
+    }
+}
+
+async function fixWholeChat() {
+    const s = getSettings();
+    const chat = getContext().chat;
+    let count = 0;
+    busy = true;
+    try {
+        for (let i = 0; i < chat.length; i++) {
+            if (applyFixToMessage(chat[i], s)) {
+                count++;
+                updateMessageBlock(i, chat[i]);
+            }
+        }
+        if (count > 0) await saveChatConditional();
+    } finally {
+        busy = false;
+    }
+    toastr.success(count + ' mensagem(ns) corrigida(s).', 'Roleplay Leash');
+}
+
+function applyColors() {
+    const s = getSettings();
+    $('#rl_style').remove();
+    if (!s.enabled || !s.customColors) return;
+    const css = `.mes_text q{color:${s.dialogueColor} !important;}.mes_text em{color:${s.actionColor} !important;}`;
+    $('<style id="rl_style"></style>').text(css).appendTo('head');
 }
 
 function buildUI() {
@@ -108,73 +169,79 @@ function buildUI() {
                     <span>Ativar</span>
                 </label>
                 <label class="checkbox_label">
-                    <input type="checkbox" id="rl_autofix" ${s.autofix ? 'checked' : ''}>
-                    <span>Corrigir automaticamente as respostas</span>
+                    <input type="checkbox" id="rl_fixchar" ${s.fixChar ? 'checked' : ''}>
+                    <span>Corrigir mensagens do LLM</span>
                 </label>
                 <label class="checkbox_label">
-                    <input type="checkbox" id="rl_reminder" ${s.reminder ? 'checked' : ''}>
-                    <span>Lembrete curto no final de cada prompt</span>
+                    <input type="checkbox" id="rl_fixuser" ${s.fixUser ? 'checked' : ''}>
+                    <span>Corrigir minhas mensagens (antes de enviar)</span>
                 </label>
-                <label for="rl_depth">Profundidade das regras principais</label>
-                <input type="number" id="rl_depth" class="text_pole" min="0" max="50" value="${s.depth}">
-                <label for="rl_main">Regras principais</label>
-                <textarea id="rl_main" class="text_pole textarea_compact" rows="8"></textarea>
-                <label for="rl_short">Lembrete curto</label>
-                <textarea id="rl_short" class="text_pole textarea_compact" rows="3"></textarea>
-                <div class="menu_button" id="rl_reset">Restaurar padrão</div>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="rl_dash" ${s.dashToQuotes ? 'checked' : ''}>
+                    <span>Converter falas com "-" / "—" em aspas</span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="rl_edit" ${s.fixOnEdit ? 'checked' : ''}>
+                    <span>Corrigir também ao editar mensagens</span>
+                </label>
+                <label class="checkbox_label">
+                    <input type="checkbox" id="rl_colors" ${s.customColors ? 'checked' : ''}>
+                    <span>Usar cores personalizadas</span>
+                </label>
+                <label for="rl_dcolor">Cor do diálogo</label>
+                <input type="color" id="rl_dcolor" value="${s.dialogueColor}">
+                <label for="rl_acolor">Cor da ação / narração</label>
+                <input type="color" id="rl_acolor" value="${s.actionColor}">
+                <div class="menu_button" id="rl_fixall">Corrigir chat inteiro agora</div>
             </div>
         </div>
     </div>`;
     $('#extensions_settings2').append(html);
-    $('#rl_main').val(s.mainPrompt);
-    $('#rl_short').val(s.shortPrompt);
 
     $('#rl_enabled').on('change', function () {
         s.enabled = this.checked;
         saveSettingsDebounced();
-        applyPrompts();
+        applyColors();
     });
-    $('#rl_autofix').on('change', function () {
-        s.autofix = this.checked;
+    $('#rl_fixchar').on('change', function () {
+        s.fixChar = this.checked;
         saveSettingsDebounced();
     });
-    $('#rl_reminder').on('change', function () {
-        s.reminder = this.checked;
+    $('#rl_fixuser').on('change', function () {
+        s.fixUser = this.checked;
         saveSettingsDebounced();
-        applyPrompts();
     });
-    $('#rl_depth').on('input', function () {
-        s.depth = Number(this.value) || 0;
+    $('#rl_dash').on('change', function () {
+        s.dashToQuotes = this.checked;
         saveSettingsDebounced();
-        applyPrompts();
     });
-    $('#rl_main').on('input', function () {
-        s.mainPrompt = this.value;
+    $('#rl_edit').on('change', function () {
+        s.fixOnEdit = this.checked;
         saveSettingsDebounced();
-        applyPrompts();
     });
-    $('#rl_short').on('input', function () {
-        s.shortPrompt = this.value;
+    $('#rl_colors').on('change', function () {
+        s.customColors = this.checked;
         saveSettingsDebounced();
-        applyPrompts();
+        applyColors();
     });
-    $('#rl_reset').on('click', function () {
-        s.mainPrompt = DEFAULT_MAIN;
-        s.shortPrompt = DEFAULT_SHORT;
-        s.depth = defaults.depth;
-        $('#rl_main').val(s.mainPrompt);
-        $('#rl_short').val(s.shortPrompt);
-        $('#rl_depth').val(s.depth);
+    $('#rl_dcolor').on('input', function () {
+        s.dialogueColor = this.value;
         saveSettingsDebounced();
-        applyPrompts();
+        applyColors();
     });
+    $('#rl_acolor').on('input', function () {
+        s.actionColor = this.value;
+        saveSettingsDebounced();
+        applyColors();
+    });
+    $('#rl_fixall').on('click', fixWholeChat);
 }
 
 jQuery(() => {
     getSettings();
     buildUI();
-    applyPrompts();
-    eventSource.on(event_types.MESSAGE_RECEIVED, onMessageReceived);
-    eventSource.on(event_types.CHAT_CHANGED, applyPrompts);
-    eventSource.on(event_types.GENERATION_STARTED, applyPrompts);
+    applyColors();
+    eventSource.on(event_types.MESSAGE_SENT, onMessageSent);
+    eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, onMessageRendered);
+    eventSource.on(event_types.MESSAGE_EDITED, onMessageEdited);
 });
